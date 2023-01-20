@@ -1,0 +1,1 @@
+int addfunc(int a, int b);
