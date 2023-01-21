@@ -11,18 +11,19 @@
 struct SideEffect {
   uint32_t line;
   uint32_t col;
-  VarDecl *sideVar;  // pointer param or global bar
+  uint32_t paramPos; // param position of function args
+  clang::VarDecl *sideVar;  // pointer param or global bar
   bool operator==(const SideEffect &other) { return sideVar == other.sideVar; }
   SideEffect() = default;
-  SideEffect(uint32_t l, uint32_t c, VarDecl *v)
-      : line(l), col(c), sideVar(v) {}
+  SideEffect(uint32_t l, uint32_t c, clang::VarDecl *v, uint32_t pos = ~0u)
+      : line(l), col(c), sideVar(v), paramPos(pos) {}
 };
 
 template <>
 struct llvm::DenseMapInfo<SideEffect> {
   static inline SideEffect getEmptyKey() { return SideEffect{0, 0, nullptr}; }
   static inline SideEffect getTombstoneKey() {
-    return SideEffect{0, 0, (VarDecl *)~0ul};
+    return SideEffect{0, 0, (clang::VarDecl *)~0ul};
   }
   static unsigned getHashValue(const SideEffect &Val) {
     uint64_t ptrVal = (uint64_t)Val.sideVar;
