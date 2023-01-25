@@ -1,7 +1,6 @@
 int a = 5;
 int b = a + 1;
 
-int mm();
 int f() {
   a = a + 1;
   return a;
