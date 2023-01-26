@@ -1,0 +1,3 @@
+[submodule "minic-test-cases-2022s"]
+	path = minic-test-cases-2022s
+	url = https://github.com/pku-minic/minic-test-cases-2022s

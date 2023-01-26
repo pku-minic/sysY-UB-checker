@@ -10,4 +10,5 @@ int f(){
 int main(){
   int a = g(var) + var[5], b = a + 1;   // UB
   a = a + f() + g(var);     // UB
+	a = a + getint() / getch();  // UB
 }
