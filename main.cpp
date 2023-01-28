@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <sstream>
 #include <fstream>
+#include <cstring>
 #include "llvm/Support/CommandLine.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
@@ -16,6 +17,7 @@
 #include "clang/ASTMatchers/ASTMatchers.h"
 #include "clang/ASTMatchers/ASTMatchFinder.h"
 #include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/Lex/Lexer.h"
 
 #include "main.hpp"
 
@@ -26,19 +28,20 @@
 /// and let getarray, getch, getint write this variable. putint, putch,
 /// putarray can't cause UB becouse their return value is void and will
 /// not participate in expression.
+// clang-format off
 const char* declstr =
-    "int __globalInput__;int getint();int getch();int getarray(int[]);void "
-    "putint(int);void "
-    "putch(int);void putarray(int, int[]);void starttime();void stoptime();\n";
-std::vector<llvm::StringRef> sysyLibFunc{"getint",    "getch",   "getarray",
-                                         "putint",    "putch",   "putarray",
-                                         "starttime", "stoptime"};
+    "int __globalInput__; int getint(){__globalInput__ = __globalInput__ + 1;return 1;} "
+    "int getch(){return getint();} int getarray(int a[]){a[0] = 1;return getint();}" 
+    "void putint(int){} void putch(int){} void putarray(int, int[]){}"
+    "void starttime(){} void stoptime(){}\n";
+// clang-format on
+
 using namespace llvm;
 using namespace clang;
 using namespace clang::tooling;
 using namespace clang::ast_matchers;
 
-using sideEffectMap = DenseMap<FunctionDecl*, DenseSet<SideEffect> >;
+using sideEffectMap = DenseMap<FunctionDecl*, DenseSet<DeclRefExpr*>>;
 
 static cl::opt<std::string> inputFile(cl::Required, cl::Positional,
                                       cl::desc("input file"));
@@ -52,16 +55,9 @@ static cl::opt<bool> initExprDump("init-list-expr-dump",
 static cl::opt<bool> stmtRefDump(
     "stmt-ref-dump", cl::value_desc("stmt-ref-dump"),
     cl::desc("output declref graph for each stmt"));
-
-auto& operator<<(decltype(errs()) o, const SideEffect& se) {
-  o << "at " << se.line << ":" << se.col << ", ";
-  if (isa<ParmVarDecl>(se.sideVar)) {
-    o << "param " << se.sideVar->getName() << " in pos " << se.paramPos << "\n";
-  } else {
-    o << se.sideVar->getName() << "\n";
-  }
-  return o;
-}
+static cl::opt<bool> sideEffectDump(
+    "side-effect-dump", cl::value_desc("side-effect-dump"),
+    cl::desc("output side effect of each function"));
 
 VarDecl* getDeclFromRef(DeclRefExpr* ref) {
   auto sidevar = dyn_cast<VarDecl>(ref->getDecl());
@@ -83,10 +79,20 @@ bool varIsGloal(VarDecl* decl) {
   return linkType == Linkage::ExternalLinkage;
 }
 
-auto getParamPos(FunctionDecl* f, ParmVarDecl* parm) {
+// https://stackoverflow.com/a/11154162/15570633
+std::string getStmtString(Stmt* s, ASTContext* ctx) {
+  auto start = s->getBeginLoc();
+  auto& sm = ctx->getSourceManager();
+  auto end = Lexer::getLocForEndOfToken(s->getEndLoc(), 0, sm, LangOptions());
+  return std::string(sm.getCharacterData(start),
+                     sm.getCharacterData(end) - sm.getCharacterData(start));
+}
+
+uint32_t getParamPos(ParmVarDecl* parm) {
+  auto f = cast<FunctionDecl>(parm->getDeclContext());
   auto iter = std::find(f->param_begin(), f->param_end(), parm);
   assert(iter != f->param_end() && "can't find parameter pos");
-  return (decltype(SideEffect::paramPos))std::distance(f->param_begin(), iter);
+  return (uint32_t)std::distance(f->param_begin(), iter);
 }
 
 DeclRefExpr* getArrayDeclFromArrayExpr(ArraySubscriptExpr* arraySubExpr) {
@@ -112,36 +118,14 @@ class FindSideEffectFuncVisitor
         allFuncs(funcs) {}
 
   bool TraverseFunctionDecl(FunctionDecl* funcDecl) {
-    assert(globalInput && "globalInput should be visited first");
     assert(!currentFunc && "currentFunc should be null!");
     fakeArrayRef.clear();
     currentFunc = funcDecl;
-    if (std::find(sysyLibFunc.begin(), sysyLibFunc.end(),
-                  funcDecl->getName()) == sysyLibFunc.end())
-      allFuncs.push_back(funcDecl);
+    allFuncs.push_back(funcDecl);
 
-    auto funcName = currentFunc->getName();
-    if (funcName == "getarray") {
-      writeEffectFuncs[currentFunc].insert(
-          SideEffect{0, 0, currentFunc->getParamDecl(0), 0});
-      writeEffectFuncs[currentFunc].insert(SideEffect{0, 0, globalInput});
-    } else if (funcName == "getint" || funcName == "getch") {
-      writeEffectFuncs[currentFunc].insert(SideEffect{0, 0, globalInput});
-    } else {
-      RecursiveASTVisitor<FindSideEffectFuncVisitor>::TraverseFunctionDecl(
-          funcDecl);
-      SmallVector<VarDecl*, 3> readVar;
-      if (readEffectFuncs.count(currentFunc) &&
-          writeEffectFuncs.count(currentFunc)) {
-        for (auto& se : readEffectFuncs[currentFunc]) {
-          if (writeEffectFuncs[currentFunc].count(se))
-            readVar.push_back(se.sideVar);
-        }
-      }
-      for (auto var : readVar) {
-        readEffectFuncs[currentFunc].erase(SideEffect{0, 0, var});
-      }
-    }
+    RecursiveASTVisitor<FindSideEffectFuncVisitor>::TraverseFunctionDecl(
+        funcDecl);
+    if (sideEffectDump) dumpSideEffectMap();
     currentFunc = nullptr;
     return true;
   }
@@ -156,9 +140,6 @@ class FindSideEffectFuncVisitor
              << ", declContext: " << v->getDeclContext()->getDeclKindName()
              << "\n";
     }
-    if (v->getName() == "__globalInput__" && varIsGloal(v)) {
-      globalInput = v;
-    }
     return true;
   }
   bool VisitInitListExpr(InitListExpr* initExpr) {  // debug only
@@ -168,7 +149,22 @@ class FindSideEffectFuncVisitor
     return true;
   }
 
-  bool VisitDeclRefExpr(DeclRefExpr* declRef);
+  bool VisitDeclRefExpr(DeclRefExpr* declRef) {
+    if (isa<FunctionDecl>(declRef->getDecl()) || !currentFunc) return true;
+    if (fakeArrayRef.count(declRef)) return true;
+    if (writeEffectFuncs.count(currentFunc) &&
+        writeEffectFuncs[currentFunc].count(declRef))
+      return true;
+    auto decl = getDeclFromRef(declRef);
+
+    if (varIsGloal(decl)) {
+      readEffectFuncs[currentFunc].insert(declRef);
+    } else if (isa<ParmVarDecl>(decl) &&
+               decl->getType()->isPointerType()) {  // array parameter
+      readEffectFuncs[currentFunc].insert(declRef);
+    }
+    return true;
+  }
 
   bool VisitCallExpr(CallExpr* callExpr) {
     auto funcDecl = callExpr->getDirectCallee();
@@ -188,26 +184,28 @@ class FindSideEffectFuncVisitor
         fakeArrayRef.insert(cast<DeclRefExpr>(trueExpr));
       }
     }
+    auto n = currentFunc->getName();
+    auto n2 = funcDecl->getName();
     if (funcDecl == currentFunc) return true;
     auto sideCheck = [=](sideEffectMap& m) {
       if (!m.count(funcDecl)) return;
-      for (const auto& sideEff : m[funcDecl]) {
-        auto sideVar = sideEff.sideVar;
-        if (dyn_cast<ParmVarDecl>(sideVar)) {
+      for (auto sideExpr : m[funcDecl]) {
+        auto sideDecl = sideExpr->getDecl();
+        if (isa<ParmVarDecl>(sideDecl)) {
           // callArg is a arraySubscriptExpr or DeclRefExpr because
           // there is no pointer arithmetics in sysY
-          auto callArg = callExpr->getArg(sideEff.paramPos)->IgnoreImpCasts();
+          auto callArg =
+              callExpr->getArg(getParamPos(cast<ParmVarDecl>(sideDecl)))
+                  ->IgnoreImpCasts();
           if (isa<ArraySubscriptExpr>(callArg)) {
             callArg =
                 getArrayDeclFromArrayExpr(cast<ArraySubscriptExpr>(callArg));
           }
           auto argDecl = getDeclFromRef(cast<DeclRefExpr>(callArg));
-          decltype(SideEffect::paramPos) pos = ~0u;
           if (argDecl->isLocalVarDecl()) {
             return;
           }
           if (isa<ParmVarDecl>(argDecl)) {  // also a parameter
-            pos = getParamPos(currentFunc, cast<ParmVarDecl>(argDecl));
             assert(argDecl->getType()->isPointerType() &&
                    "only array type can pass side effect in sysY");
           } else {
@@ -215,12 +213,11 @@ class FindSideEffectFuncVisitor
                    "only local, param and global var in sysY");
           }
           assert(currentFunc);
-          m[currentFunc].insert(
-              SideEffect{sideEff.col, sideEff.line, argDecl, pos});
-
+          // implicitly remove repeat ref, should be safe?
+          m[currentFunc].insert(cast<DeclRefExpr>(callArg));
         } else {
           assert(currentFunc);
-          m[currentFunc].insert(sideEff);
+          m[currentFunc].insert(sideExpr);
         }
       }
     };
@@ -228,37 +225,34 @@ class FindSideEffectFuncVisitor
     sideCheck(readEffectFuncs);
     return true;
   }
-  bool VisitBinaryOperator(BinaryOperator* binOp);
-  /*
-    bool VisitDeclStmt(DeclStmt* decl) {
-      errs() << "start\n";
-      for (auto d : decl->children()) {
-        d->dump();
+  bool VisitBinaryOperator(BinaryOperator* binOp) {
+    if (binOp->getOpcode() != BO_Assign || !currentFunc) return true;
+    auto lhs = binOp->getLHS();
+
+    if (auto declRef = dyn_cast<DeclRefExpr>(lhs)) {
+      auto sidevar = getDeclFromRef(declRef);
+      if (varIsGloal(sidevar)) {  // sidevar is global
+        writeEffectFuncs[currentFunc].insert(declRef);
       }
-      errs() << "end\n";
-      return true;
+    } else if (auto arraySubExpr = dyn_cast<ArraySubscriptExpr>(
+                   lhs)) {  // left operand is an array element
+      auto declRef = getArrayDeclFromArrayExpr(arraySubExpr);
+      auto arrayVar = getDeclFromRef(declRef);
+      if (varIsGloal(arrayVar)) {
+        writeEffectFuncs[currentFunc].insert(declRef);
+      } else if (auto paramDecl = dyn_cast<ParmVarDecl>(arrayVar)) {
+        auto iter = std::find(currentFunc->param_begin(),
+                              currentFunc->param_end(), paramDecl);
+        assert(iter != currentFunc->param_end() && "unknown param decl");
+        writeEffectFuncs[currentFunc].insert(declRef);
+      }
+    } else {
+      llvm_unreachable("only array element or variable can be lvalue in sysY");
     }
-  */
-  /*
-   bool VisitForStmt(ForStmt* forSt) {
-     errs() << "start for\n";
-     forSt->getInit()->dump();
-     errs() << "\n";
-     forSt->getCond()->dump();
-     errs() << "\n";
-     forSt->getInc()->dump();
-     errs() << "\n";
-     forSt->getBody();
-     errs() << "\n";
-     auto s = forSt->getConditionVariableDeclStmt();
-     if (!s)
-       errs() << "empty\n";
-     else
-       s->dump();
-     errs() << "end\n";
-     return true;
-   }
- */
+    return true;
+  }
+  void dumpSideEffectMap();
+
  private:
   friend class UBCheckConsumer;
   FunctionDecl* currentFunc = nullptr;
@@ -267,38 +261,44 @@ class FindSideEffectFuncVisitor
   std::vector<FunctionDecl*>& allFuncs;
   ASTContext* Context;
 
-  VarDecl* globalInput = nullptr;
   DenseSet<DeclRefExpr*> fakeArrayRef;
 };
 
 class FindUBVisitor : public RecursiveASTVisitor<FindUBVisitor> {
  public:
-  using VarUsedRecord = DenseMap<DeclRefExpr*, std::vector<DeclRefExpr*> >;
+  enum Order : unsigned { ORDER, UNORDER };
+  using ReachableGraph = DenseMap<VarDecl*, DenseSet<RefPair>>;
+  using VarRefRecord = DenseMap<VarDecl*, std::vector<UniqueRef>>;
   explicit FindUBVisitor(ASTContext* Context, sideEffectMap& wMap,
                          sideEffectMap& rMap, std::vector<FunctionDecl*>& funcs)
       : Context(Context),
         writeEffectFuncs(wMap),
         readEffectFuncs(rMap),
         allFuncs(funcs) {}
-  bool VisitVarDecl(VarDecl* v) {
-    if (v->getName() == "__globalInput__" && varIsGloal(v)) {
-      globalInput = v;
-    }
-    return true;
-  }
+  /*
+bool VisitVarDecl(VarDecl* v) {
+if (v->getName() == "__globalInput__" && varIsGloal(v)) {
+globalInput = v;
+}
+return true;
+}*/
+  // traverse binary operator, callexpr, arraysubscriptexr,
+  //
+  // bool TraverseArraySubscriptExpr(ArraySubscriptExpr* arrayExpr) {}
 
   bool TraverseCallExpr(CallExpr* callExp) {
     auto callRef = cast<DeclRefExpr>(
         callExp->getCallee()->IgnoreImpCasts());  // safe in sysY
-    declRefCall.insert({callRef, callExp});
-    VisitDeclRefExpr(callRef);
-    callStack.push_back(callRef);
+    declRefCall[callRef] = callExp;
+    auto numArgs = callExp->getNumArgs();
+    auto tmpRefs = new VarRefRecord[numArgs];
+    VarRefRecord tmpOrgRef = std::move(refs);
 
     auto funcDecl = callExp->getDirectCallee();
     assert(funcDecl && "only direct function call in sysY");
     uint32_t tmpIndex = 0;
     for (auto arg : callExp->arguments()) {
-      if (funcDecl->getParamDecl(tmpIndex++)->getType()->isPointerType()) {
+      if (funcDecl->getParamDecl(tmpIndex)->getType()->isPointerType()) {
         auto trueExpr = arg->IgnoreImpCasts();
         if (isa<ArraySubscriptExpr>(trueExpr)) {
           trueExpr =
@@ -310,16 +310,38 @@ class FindUBVisitor : public RecursiveASTVisitor<FindUBVisitor> {
         fakeArrayRef.insert(cast<DeclRefExpr>(trueExpr));
       }
       TraverseStmt(arg);
+      tmpRefs[tmpIndex] = std::move(refs);
+      ++tmpIndex;
     }
-    callStack.pop_back();
+
+    VisitDeclRefExpr(callRef);
+
+    for (auto& p : refs) {
+      for (tmpIndex = 0; tmpIndex < numArgs; ++tmpIndex) {
+        auto& map = tmpRefs[tmpIndex];
+        if (map.count(p.getFirst())) {
+          for (auto refExpr1 : map[p.getFirst()]) {
+            for (auto refExpr2 : p.getSecond()) {
+              reachGraph[p.getFirst()].insert({refExpr2, refExpr1});
+            }
+          }
+        }
+      }
+    }
+    for (tmpIndex = 0; tmpIndex < numArgs; ++tmpIndex) {  // merge refs
+      for (auto& p : tmpRefs[tmpIndex]) {
+        mergeVector(refs[p.getFirst()], p.getSecond());
+      }
+    }
+    for (auto& p : tmpOrgRef) {
+      mergeVector(refs[p.getFirst()], p.getSecond());
+    }
+    delete[] tmpRefs;
     return true;
   }
   bool TraverseFunctionDecl(FunctionDecl* funcDecl) {
     // simplified version of RecursiveVisitor::TraverseFunctionDecl
     fakeArrayRef.clear();
-    if (std::find(sysyLibFunc.begin(), sysyLibFunc.end(),
-                  funcDecl->getName()) != sysyLibFunc.end())
-      return true;
     for (auto parm : funcDecl->parameters()) {
       TraverseDecl(parm);
     }
@@ -328,30 +350,90 @@ class FindUBVisitor : public RecursiveASTVisitor<FindUBVisitor> {
     return true;
   }
 
-  bool VisitBinaryOperator(BinaryOperator* binOp) {
-    if (binOp->getOpcode() != BO_Assign) return true;
-    if (isa<DeclRefExpr>(binOp->getLHS())) {
-      lhsRef = cast<DeclRefExpr>(binOp->getLHS());
+  bool TraverseBinaryOperator(BinaryOperator* binOp) {
+    if (binOp->getOpcode() == BO_Assign) {
+      if (isa<DeclRefExpr>(binOp->getLHS())) {
+        fakeArrayRef.insert(cast<DeclRefExpr>(binOp->getLHS()));
+      } else {
+        fakeArrayRef.insert(getArrayDeclFromArrayExpr(
+            cast<ArraySubscriptExpr>(binOp->getLHS())));
+      }
+    }
+
+    if (binOp->getOpcode() == BO_LAnd || binOp->getOpcode() == BO_LOr) {
+      VarRefRecord tmpOrgRef = std::move(refs);
+      TraverseStmt(binOp->getLHS());
+      VarRefRecord tmprefs = std::move(refs);
+      TraverseStmt(binOp->getRHS());
+      for (const auto& p1 : refs) {
+        if (tmprefs.count(p1.getFirst())) {
+          for (auto pair1 : p1.getSecond()) {
+            for (auto pair2 : tmprefs[p1.getFirst()]) {
+              reachGraph[p1.getFirst()].insert({pair1, pair2});
+            }
+          }
+        }
+      }
+      for (const auto& p : tmprefs) {  // merge refs
+        mergeVector(refs[p.getFirst()], p.getSecond());
+      }
+      for (const auto& p : tmpOrgRef) {
+        mergeVector(refs[p.getFirst()], p.getSecond());
+      }
     } else {
-      lhsRef =
-          getArrayDeclFromArrayExpr(cast<ArraySubscriptExpr>(binOp->getLHS()));
+      TraverseStmt(binOp->getLHS());
+      TraverseStmt(binOp->getRHS());
     }
     return true;
   }
 
   bool VisitDeclRefExpr(DeclRefExpr* refExp) {
-    if (refExp == lhsRef) {
-      assert(callStack.empty() && "lhsRef should be not as an arg");
-      return true;
-    }
     if (fakeArrayRef.count(refExp)) return true;
-    usedRecord.insert({refExp, {}});
-    if (!callStack.empty()) {
-      assert(usedRecord.count(callStack.back()) &&
-             "Expr in callStack should be in usedRecord");
-      usedRecord[callStack.back()].push_back(refExp);
+    auto decl = refExp->getDecl();
+    if (isa<FunctionDecl>(decl)) {
+      auto callExpr = declRefCall[refExp];
+      decltype(refs) tmpref;
+      assert(callExpr &&
+             "should map any DeclRef of func type into its callExpr");
+      auto helpFunc = [decl, callExpr, this, &tmpref](sideEffectMap& m,
+                                                      RWType t) {
+        for (auto varRef : m[cast<FunctionDecl>(decl)]) {
+          auto varDecl = cast<VarDecl>(varRef->getDecl());
+          if (isa<ParmVarDecl>(varDecl)) {
+            auto arg = callExpr->getArg(getParamPos(cast<ParmVarDecl>(varDecl)))
+                           ->IgnoreImpCasts();
+            auto arrayRef =
+                isa<DeclRefExpr>(arg)
+                    ? cast<DeclRefExpr>(arg)
+                    : getArrayDeclFromArrayExpr(cast<ArraySubscriptExpr>(arg));
+            // arrayRef should be a fake arrayRef
+            tmpref[cast<VarDecl>(arrayRef->getDecl())].push_back(
+                {arrayRef, (refCnt += 2) | t});
+            assert(fakeArrayRef.count(arrayRef) &&
+                   "array parameter should be a fake ref");
+          } else {
+            assert(varIsGloal(varDecl) &&
+                   "only global and parameter have side effect");
+            tmpref[varDecl].push_back({varRef, (refCnt += 2) | t});
+          }
+        }
+      };
+      helpFunc(writeEffectFuncs, WRITE);
+      helpFunc(readEffectFuncs, READ);
+      for (auto& p : tmpref) {
+        auto& vec = p.getSecond();
+        for (auto iter = vec.begin(); iter != vec.end(); ++iter) {
+          for (auto iter2 = iter + 1; iter2 != vec.end(); ++iter2) {
+            reachGraph[p.getFirst()].insert({*iter, *iter2});
+          }
+        }
+        mergeVector(refs[p.getFirst()], p.getSecond());
+      }
+
     } else {
-      roots.push_back(refExp);
+      // one statement has at most one write which is thought as fake ref
+      refs[cast<VarDecl>(refExp->getDecl())].push_back(
+          {refExp, (refCnt += 2) | READ});
     }
     return true;
   }
@@ -360,11 +442,7 @@ class FindUBVisitor : public RecursiveASTVisitor<FindUBVisitor> {
   enum RWType : unsigned { READ, WRITE, NONE };
   enum Position : unsigned { START, END };
   enum Direction : unsigned { LINE, COLUMN };
-  struct PosStruct {
-    uint32_t line;
-    uint32_t col;
-    RWType rw;
-  };
+
   void InternalVisitStmt(Stmt* s) {  // call this when s is a full expression
     // for, while and if stmt will have optional cond variable(declare variable
     // in condition expression), this will be nullptr in sysY but what is Init
@@ -388,110 +466,46 @@ class FindUBVisitor : public RecursiveASTVisitor<FindUBVisitor> {
         TraverseStmt(s);
     }
     if (stmtRefDump) {
-      errs() << "line " << getLineOrColumn(s, START, LINE, Context)
-             << ", Stmt Start\n";
-      graphDump(usedRecord, roots);
-      errs() << "line " << getLineOrColumn(s, END, LINE, Context)
-             << ", Stmt End\n";
+      errs() << "[Stmt Start, line " << getLineOrColumn(s, START, LINE, Context)
+             << "] " << getStmtString(s, Context) << "\n";
+      graphDump();
+      errs() << "[Stmt End, line " << getLineOrColumn(s, END, LINE, Context)
+             << "]\n\n";
     }
     DenseSet<VarDecl*> tmp;
-    findUB(roots, getLineOrColumn(s, START, LINE, Context), tmp);
+    findUB(getLineOrColumn(s, START, LINE, Context), s);
   }
 
   /// @brief core function to find UB by flatten trees, and split forest
   /// recursively
   /// @param stmtLine, line number of current statement
-  /// @param forestRoots, forest roots
-  void findUB(ArrayRef<DeclRefExpr*> forestRoots, uint32_t stmtLine,
-              DenseSet<VarDecl*>& foundUBvars) {
-    std::vector<DenseMap<VarDecl*, std::vector<PosStruct> > > usedVar;
-    usedVar.resize(forestRoots.size());
-    std::vector<VarDecl*> vars;
-    std::vector<VarDecl*> UBvars;
-    for (uint32_t i = 0, l = forestRoots.size(); i < l; ++i) {
-      flattenTree(forestRoots[i], usedVar[i]);
-      for (auto& p : usedVar[i]) {
-        vars.push_back(p.getFirst());
-      }
-    }
-    for (auto var : vars) {
-      if (foundUBvars.count(var)) continue;
-      int status[2]{0, 0};
-      for (auto& map : usedVar) {
-        if (map.count(var)) {
-          auto f =
-              std::find_if(map[var].begin(), map[var].end(),
-                           [](const PosStruct& p) { return p.rw == WRITE; });
-          status[f != map[var].end()]++;
-          if (status[WRITE] >= 1 && status[WRITE] + status[READ] >= 2) {
-            UBvars.push_back(var);
-            foundUBvars.insert(var);
-            break;
-          }
+  void findUB(uint32_t stmtLine, Stmt* st) {
+    for (auto& p : refs) {
+      auto var = p.getFirst();
+      for (auto iter = p.getSecond().begin(); iter != p.getSecond().end();
+           ++iter) {
+        if ((iter->second & WRITE) != WRITE) continue;
+        for (auto iter2 = p.getSecond().begin(); iter2 != p.getSecond().end();
+             ++iter2) {
+          if (*iter != *iter2 &&
+              !reachGraph[p.getFirst()].count({*iter, *iter2}))
+            goto FAIL;
         }
       }
-    }
-    for (auto var : UBvars) {
-      errs() << "[WARNING] Possible Undefined Behavior in Statement line "
-             << stmtLine << "\n";
+      continue;
+    FAIL:
+      errs() << "[WARNING Possible Undefined Behavior in Statement line "
+             << stmtLine << "] " << getStmtString(st, Context) << "\n";
       errs() << "VAR: " << var->getName() << " declaration at "
              << getLineOrColumn(var, START, LINE, Context) << ":"
              << getLineOrColumn(var, START, COLUMN, Context) << "\n";
-      for (auto& map : usedVar) {
-        if (map.count(var)) {
-          for (const auto& p : map[var]) {
-            errs() << "at " << p.line << ":" << p.col << ", "
-                   << (p.rw == WRITE ? "write\n" : "read\n");
-          }
-        }
+      for (auto ref : refs[p.getFirst()]) {
+        errs() << "at " << getLineOrColumn(ref.first, START, LINE, Context)
+               << ":" << getLineOrColumn(ref.first, START, COLUMN, Context)
+               << ", "
+               << ((ref.second & WRITE) == WRITE ? "write\n" : "read\n");
       }
       errs() << "[END WARNING]\n";
-    }
-    for (auto var : forestRoots) {
-      assert(usedRecord.count(var) && "usedRecord should contain all refExpr");
-      if (!usedRecord[var].empty()) {
-        findUB(usedRecord[var], stmtLine, foundUBvars);
-      }
-    }
-  }
-
-  /// @brief  given a DeclRefExpr root, return all variables used by the tree
-  /// @param root
-  /// @param usedVar -> return value
-  void flattenTree(DeclRefExpr* root,
-                   DenseMap<VarDecl*, std::vector<PosStruct> >& usedVar) {
-    auto decl = root->getDecl();
-    if (isa<FunctionDecl>(decl)) {
-      assert(declRefCall.count(root) && "we should store any callexpr");
-      auto callExpr = declRefCall[root];
-      auto helpFunc = [decl, callExpr, &usedVar](sideEffectMap& m, RWType t) {
-        for (const auto& se : m[cast<FunctionDecl>(decl)]) {
-          if (isa<ParmVarDecl>(se.sideVar)) {
-            auto arg = callExpr->getArg(se.paramPos)->IgnoreImpCasts();
-            auto arrayRef =
-                isa<DeclRefExpr>(arg)
-                    ? cast<DeclRefExpr>(arg)
-                    : getArrayDeclFromArrayExpr(cast<ArraySubscriptExpr>(arg));
-            usedVar[cast<VarDecl>(arrayRef->getDecl())].push_back(
-                {se.line, se.col, t});
-          } else {
-            usedVar[se.sideVar].push_back({se.line, se.col, t});
-          }
-        }
-      };
-      helpFunc(readEffectFuncs, READ);
-      helpFunc(writeEffectFuncs, WRITE);
-      for (auto child : usedRecord[root]) {  // flatten recursively
-        flattenTree(child, usedVar);
-      }
-    } else if (isa<VarDecl>(decl)) {
-      usedVar[cast<VarDecl>(decl)].push_back(
-          {getLineOrColumn(root, START, LINE, Context),
-           getLineOrColumn(root, START, COLUMN, Context), READ});
-      assert((usedRecord.count(root) || usedRecord[root].empty()) &&
-             "VarRef don't have child");
-    } else {
-      llvm_unreachable("there should only be FunctionDecl and VarDecl in sysY");
     }
   }
 
@@ -511,26 +525,56 @@ class FindUBVisitor : public RecursiveASTVisitor<FindUBVisitor> {
   }
 
   void resetStmtTraversal() {
-    usedRecord.clear();
-    roots.clear();
-    assert(callStack.empty() && "callStack should be empty after traversal");
-    lhsRef = nullptr;
+    reachGraph.clear();
+    refs.clear();
+    declRefCall.clear();
   }
 
-  void graphDump(VarUsedRecord& record, std::vector<DeclRefExpr*> r) {
-    DenseSet<DeclRefExpr*> used;
-    for (auto& rf : r) {
-      edgeDump(record, rf, used);
+  void graphDump() {
+    for (auto& p : refs) {
+      auto map = dumpRefs(p.getFirst());
+      errs() << "[REACHABLITIY]\n";
+      bool hasOut = false;
+      for (uint32_t i = 0, leng = map.size(); i < leng; ++i) {
+        for (uint32_t j = i + 1; j < leng; ++j) {
+          if (reachGraph.count(p.getFirst()) &&
+              reachGraph[p.getFirst()].count({map[i], map[j]})) {
+            hasOut = true;
+            errs() << "[" << i << ", " << j << ", order]";
+          }
+        }
+      }
+      if (hasOut)
+        errs() << "\n[END]\n";
+      else
+        errs() << "[END]\n";
     }
   }
-  void edgeDump(VarUsedRecord& record, DeclRefExpr* ref,
-                DenseSet<DeclRefExpr*> used, uint32_t depth = 0) {
-    if (used.count(ref)) return;
-    errs() << std::string(depth, ' ') << ref->getDecl()->getName() << "\n";
-    used.insert(ref);
-    for (auto& sub : record[ref]) {
-      edgeDump(record, sub, used, depth + 2);
+  std::vector<UniqueRef> dumpRefs(VarDecl* v) {
+    errs() << "[VAR]: " << v->getName() << "\n";
+    uint32_t tmpIndex = 0;
+    std::vector<UniqueRef> map;
+    if (!refs.count(v)) return map;
+    for (auto expr : refs[v]) {
+      errs() << "[" << map.size() << "]";
+      if ((expr.second & WRITE) == READ)
+        errs() << "read at ";
+      else if ((expr.second & WRITE) == WRITE)
+        errs() << "write at ";
+      else
+        llvm_unreachable("SHOULD ONLY READ AND WRITE");
+      errs() << getLineOrColumn(expr.first, START, LINE, Context) << ":"
+             << getLineOrColumn(expr.first, START, COLUMN, Context) << "\n";
+      map.push_back(expr);
     }
+    return map;
+  }
+
+  template <class T>
+  void mergeVector(std::vector<T>& v1, const std::vector<T>& v2) {
+    auto refsSize = v1.size();
+    v1.resize(refsSize + v2.size());
+    std::memcpy(v1.data() + refsSize, v2.data(), v2.size() * sizeof(T));
   }
 
   friend class UBCheckConsumer;
@@ -539,73 +583,34 @@ class FindUBVisitor : public RecursiveASTVisitor<FindUBVisitor> {
   sideEffectMap& readEffectFuncs;
   std::vector<FunctionDecl*>& allFuncs;
   ASTContext* Context;
+  uint64_t refCnt = 0;
 
   // used for single stmt traversal
-  VarUsedRecord usedRecord;
-  std::vector<DeclRefExpr*> roots;
   DenseMap<DeclRefExpr*, CallExpr*> declRefCall;
-  std::vector<DeclRefExpr*> callStack;
-  DeclRefExpr* lhsRef;
-
-  VarDecl* globalInput = nullptr;
+  // if refpair in reachGraph, the ref pair is ordered
+  ReachableGraph reachGraph;
+  VarRefRecord refs;
   DenseSet<DeclRefExpr*> fakeArrayRef;
 };
 
-bool FindSideEffectFuncVisitor::VisitDeclRefExpr(DeclRefExpr* declRef) {
-  auto lineNum = FindUBVisitor::getLineOrColumn(declRef, FindUBVisitor::START,
-                                                FindUBVisitor::LINE, Context);
-  auto colNum = FindUBVisitor::getLineOrColumn(declRef, FindUBVisitor::START,
-                                               FindUBVisitor::COLUMN, Context);
-  if (isa<FunctionDecl>(declRef->getDecl()) || !currentFunc) return true;
-  if (fakeArrayRef.count(declRef)) return true;
-  auto decl = getDeclFromRef(declRef);
-  /*auto funcname = currentFunc == nullptr ? "" : currentFunc->getName();
-  auto varname = decl->getName();
-  auto t = decl->getType();
-  t.dump();*/
-  if (varIsGloal(decl)) {
-    readEffectFuncs[currentFunc].insert(SideEffect{lineNum, colNum, decl});
-  } else if (isa<ParmVarDecl>(decl) &&
-             decl->getType()->isPointerType()) {  // array parameter
-    readEffectFuncs[currentFunc].insert(
-        SideEffect{lineNum, colNum, decl,
-                   getParamPos(currentFunc, cast<ParmVarDecl>(decl))});
-  }
-  return true;
-}
-bool FindSideEffectFuncVisitor::VisitBinaryOperator(BinaryOperator* binOp) {
-  if (binOp->getOpcode() != BO_Assign || !currentFunc) return true;
-  auto lhs = binOp->getLHS();
-  auto lineNum = FindUBVisitor::getLineOrColumn(lhs, FindUBVisitor::START,
-                                                FindUBVisitor::LINE, Context);
-  auto colNum = FindUBVisitor::getLineOrColumn(lhs, FindUBVisitor::START,
-                                               FindUBVisitor::COLUMN, Context);
-
-  if (auto declRef = dyn_cast<DeclRefExpr>(lhs)) {
-    auto sidevar = getDeclFromRef(declRef);
-    if (varIsGloal(sidevar)) {  // sidevar is global
-      writeEffectFuncs[currentFunc].insert(
-          SideEffect{lineNum, colNum, sidevar});
+void FindSideEffectFuncVisitor::dumpSideEffectMap() {
+  errs() << "[START] Function: " << currentFunc->getName() << "\n";
+  auto helpFunc = [this](const char* s, sideEffectMap& m) {
+    if (m.count(currentFunc)) {
+      for (auto p : m[currentFunc]) {
+        errs() << s << p->getDecl()->getName() << ", at "
+               << FindUBVisitor::getLineOrColumn(p, FindUBVisitor::START,
+                                                 FindUBVisitor::LINE, Context)
+               << ":"
+               << FindUBVisitor::getLineOrColumn(p, FindUBVisitor::START,
+                                                 FindUBVisitor::COLUMN, Context)
+               << "\n";
+      }
     }
-  } else if (auto arraySubExpr = dyn_cast<ArraySubscriptExpr>(
-                 lhs)) {  // left operand is an array element
-    auto declRef = getArrayDeclFromArrayExpr(arraySubExpr);
-    auto arrayVar = getDeclFromRef(declRef);
-    if (varIsGloal(arrayVar)) {
-      writeEffectFuncs[currentFunc].insert(
-          SideEffect{lineNum, colNum, arrayVar});
-    } else if (auto paramDecl = dyn_cast<ParmVarDecl>(arrayVar)) {
-      auto iter = std::find(currentFunc->param_begin(),
-                            currentFunc->param_end(), paramDecl);
-      assert(iter != currentFunc->param_end() && "unknown param decl");
-      writeEffectFuncs[currentFunc].insert(SideEffect{
-          lineNum, colNum, arrayVar,
-          (uint32_t)std::distance(currentFunc->param_begin(), iter)});
-    }
-  } else {
-    llvm_unreachable("only array element or variable can be lvalue in sysY");
-  }
-  return true;
+  };
+  helpFunc("write ", writeEffectFuncs);
+  helpFunc("read ", readEffectFuncs);
+  errs() << "[END]\n";
 }
 
 class UBCheckConsumer : public clang::ASTConsumer {

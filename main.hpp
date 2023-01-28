@@ -7,30 +7,34 @@
 #include "llvm/Support/Casting.h"
 
 // class VarDecl;
-
-struct SideEffect {
-  uint32_t line;
-  uint32_t col;
-  uint32_t paramPos; // param position of function args
-  clang::VarDecl *sideVar;  // pointer param or global bar
-  bool operator==(const SideEffect &other) { return sideVar == other.sideVar; }
-  SideEffect() = default;
-  SideEffect(uint32_t l, uint32_t c, clang::VarDecl *v, uint32_t pos = ~0u)
-      : line(l), col(c), sideVar(v), paramPos(pos) {}
+using namespace clang;
+using UniqueRef = std::pair<DeclRefExpr*, uint64_t>;
+struct RefPair {
+  UniqueRef ref1;
+  UniqueRef ref2;
+  bool operator==(const RefPair &other) const {
+    return (ref1 == other.ref1 && ref2 == other.ref2) ||
+           (ref2 == other.ref1 && ref1 == other.ref2);
+  }
+  RefPair(UniqueRef r1, UniqueRef r2) : ref1(r1), ref2(r2) {}
 };
 
 template <>
-struct llvm::DenseMapInfo<SideEffect> {
-  static inline SideEffect getEmptyKey() { return SideEffect{0, 0, nullptr}; }
-  static inline SideEffect getTombstoneKey() {
-    return SideEffect{0, 0, (clang::VarDecl *)~0ul};
+struct llvm::DenseMapInfo<RefPair> {
+  static inline RefPair getEmptyKey() {
+    auto emptyKey = DenseMapInfo<UniqueRef>::getEmptyKey();
+    return RefPair{emptyKey, emptyKey};
   }
-  static unsigned getHashValue(const SideEffect &Val) {
-    uint64_t ptrVal = (uint64_t)Val.sideVar;
-    return (ptrVal >> 4) ^ (ptrVal >> 9);
+  static inline RefPair getTombstoneKey() {
+    auto tombKey = DenseMapInfo<UniqueRef>::getTombstoneKey();
+    return RefPair{tombKey, tombKey};
   }
-  static bool isEqual(const SideEffect &LHS, const SideEffect &RHS) {
-    return LHS.sideVar == RHS.sideVar;
+  static unsigned getHashValue(const RefPair &Val) {
+    return DenseMapInfo<UniqueRef>::getHashValue(Val.ref1) +
+           DenseMapInfo<UniqueRef>::getHashValue(Val.ref2);
+  }
+  static bool isEqual(const RefPair &LHS, const RefPair &RHS) {
+    return LHS == RHS;
   }
 };
 
