@@ -110,18 +110,14 @@ class FindSideEffectFuncVisitor
     : public RecursiveASTVisitor<FindSideEffectFuncVisitor> {
  public:
   explicit FindSideEffectFuncVisitor(ASTContext* Context, sideEffectMap& wMap,
-                                     sideEffectMap& rMap,
-                                     std::vector<FunctionDecl*>& funcs)
-      : Context(Context),
-        writeEffectFuncs(wMap),
-        readEffectFuncs(rMap),
-        allFuncs(funcs) {}
+                                     sideEffectMap& rMap)
+      : Context(Context), writeEffectFuncs(wMap), readEffectFuncs(rMap) {}
 
   bool TraverseFunctionDecl(FunctionDecl* funcDecl) {
     assert(!currentFunc && "currentFunc should be null!");
     fakeArrayRef.clear();
     currentFunc = funcDecl;
-    allFuncs.push_back(funcDecl);
+    if (currentFunc->getName() == "main") main = currentFunc;
 
     RecursiveASTVisitor<FindSideEffectFuncVisitor>::TraverseFunctionDecl(
         funcDecl);
@@ -186,6 +182,7 @@ class FindSideEffectFuncVisitor
     }
     auto n = currentFunc->getName();
     auto n2 = funcDecl->getName();
+    auto n3 = getStmtString(callExpr, Context);
     if (funcDecl == currentFunc) return true;
     auto sideCheck = [=](sideEffectMap& m) {
       if (!m.count(funcDecl)) return;
@@ -214,9 +211,12 @@ class FindSideEffectFuncVisitor
           }
           assert(currentFunc);
           // implicitly remove repeat ref, should be safe?
+          // e.g, reading callArg multiple times in callee causes callArg
+          // inserted repeatedly
           m[currentFunc].insert(cast<DeclRefExpr>(callArg));
         } else {
           assert(currentFunc);
+          // implicitly remove repeat ref, should be safe?
           m[currentFunc].insert(sideExpr);
         }
       }
@@ -258,7 +258,7 @@ class FindSideEffectFuncVisitor
   FunctionDecl* currentFunc = nullptr;
   sideEffectMap& writeEffectFuncs;
   sideEffectMap& readEffectFuncs;
-  std::vector<FunctionDecl*>& allFuncs;
+  FunctionDecl* main;
   ASTContext* Context;
 
   DenseSet<DeclRefExpr*> fakeArrayRef;
@@ -270,23 +270,15 @@ class FindUBVisitor : public RecursiveASTVisitor<FindUBVisitor> {
   using ReachableGraph = DenseMap<VarDecl*, DenseSet<RefPair>>;
   using VarRefRecord = DenseMap<VarDecl*, std::vector<UniqueRef>>;
   explicit FindUBVisitor(ASTContext* Context, sideEffectMap& wMap,
-                         sideEffectMap& rMap, std::vector<FunctionDecl*>& funcs)
-      : Context(Context),
-        writeEffectFuncs(wMap),
-        readEffectFuncs(rMap),
-        allFuncs(funcs) {}
-  /*
-bool VisitVarDecl(VarDecl* v) {
-if (v->getName() == "__globalInput__" && varIsGloal(v)) {
-globalInput = v;
-}
-return true;
-}*/
-  // traverse binary operator, callexpr, arraysubscriptexr,
-  //
-  // bool TraverseArraySubscriptExpr(ArraySubscriptExpr* arrayExpr) {}
+                         sideEffectMap& rMap)
+      : Context(Context), writeEffectFuncs(wMap), readEffectFuncs(rMap) {}
+
+  void UBcheck(FunctionDecl* entryFunc) { TraverseFunctionDecl(entryFunc); }
 
   bool TraverseCallExpr(CallExpr* callExp) {
+    TraverseCallee(callExp);
+    auto funcDecl = callExp->getDirectCallee();
+
     auto callRef = cast<DeclRefExpr>(
         callExp->getCallee()->IgnoreImpCasts());  // safe in sysY
     declRefCall[callRef] = callExp;
@@ -294,8 +286,6 @@ return true;
     auto tmpRefs = new VarRefRecord[numArgs];
     VarRefRecord tmpOrgRef = std::move(refs);
 
-    auto funcDecl = callExp->getDirectCallee();
-    assert(funcDecl && "only direct function call in sysY");
     uint32_t tmpIndex = 0;
     for (auto arg : callExp->arguments()) {
       if (funcDecl->getParamDecl(tmpIndex)->getType()->isPointerType()) {
@@ -407,8 +397,14 @@ return true;
                     ? cast<DeclRefExpr>(arg)
                     : getArrayDeclFromArrayExpr(cast<ArraySubscriptExpr>(arg));
             // arrayRef should be a fake arrayRef
-            tmpref[cast<VarDecl>(arrayRef->getDecl())].push_back(
-                {arrayRef, (refCnt += 2) | t});
+            auto argDecl = cast<VarDecl>(arrayRef->getDecl());
+            if (isa<ParmVarDecl>(argDecl)) {
+              tmpref[getArgFromParm(cast<ParmVarDecl>(argDecl), callStack)]
+                  .push_back({arrayRef, (refCnt += 2) | t});
+            } else {
+              assert(varIsGloal(argDecl) || argDecl->isLocalVarDecl());
+              tmpref[argDecl].push_back({arrayRef, (refCnt += 2) | t});
+            }
             assert(fakeArrayRef.count(arrayRef) &&
                    "array parameter should be a fake ref");
           } else {
@@ -432,8 +428,13 @@ return true;
 
     } else {
       // one statement has at most one write which is thought as fake ref
-      refs[cast<VarDecl>(refExp->getDecl())].push_back(
-          {refExp, (refCnt += 2) | READ});
+      auto varDecl = cast<VarDecl>(refExp->getDecl());
+      if (isa<ParmVarDecl>(varDecl) && varDecl->getType()->isPointerType()) {
+        auto argDecl = getArgFromParm(cast<ParmVarDecl>(varDecl), callStack);
+        refs[argDecl].push_back({refExp, (refCnt += 2) | READ});
+      } else {
+        refs[varDecl].push_back({refExp, (refCnt += 2) | READ});
+      }
     }
     return true;
   }
@@ -476,6 +477,28 @@ return true;
     findUB(getLineOrColumn(s, START, LINE, Context), s);
   }
 
+  void TraverseCallee(CallExpr* call) {
+    auto subFunc = call->getDirectCallee();
+    // avoid recursive call
+    if (!callStack.empty() && callStack.back()->getDirectCallee() == subFunc)
+      return;
+    assert(subFunc && "only direct function call in sysY");
+
+    auto tmpFakeArrayRef = std::move(fakeArrayRef);
+    auto tmpReachGraph = std::move(reachGraph);
+    auto tmpRefs = std::move(refs);
+    auto tmpDeclRefCall = std::move(declRefCall);
+
+    callStack.push_back(call);
+    TraverseFunctionDecl(subFunc);
+    callStack.pop_back();
+
+    fakeArrayRef = std::move(tmpFakeArrayRef);
+    reachGraph = std::move(tmpReachGraph);
+    refs = std::move(tmpRefs);
+    declRefCall = std::move(tmpDeclRefCall);
+  }
+
   /// @brief core function to find UB by flatten trees, and split forest
   /// recursively
   /// @param stmtLine, line number of current statement
@@ -496,6 +519,7 @@ return true;
     FAIL:
       errs() << "[WARNING Possible Undefined Behavior in Statement line "
              << stmtLine << "] " << getStmtString(st, Context) << "\n";
+      dumpCallStack();
       errs() << "VAR: " << var->getName() << " declaration at "
              << getLineOrColumn(var, START, LINE, Context) << ":"
              << getLineOrColumn(var, START, COLUMN, Context) << "\n";
@@ -506,6 +530,26 @@ return true;
                << ((ref.second & WRITE) == WRITE ? "write\n" : "read\n");
       }
       errs() << "[END WARNING]\n";
+    }
+  }
+
+  static VarDecl* getArgFromParm(ParmVarDecl* parmDecl,
+                                 ArrayRef<CallExpr*> callStack) {
+    auto argExpr =
+        callStack.back()->getArg(getParamPos(parmDecl))->IgnoreImpCasts();
+    if (isa<ArraySubscriptExpr>(argExpr)) {
+      argExpr = getArrayDeclFromArrayExpr(cast<ArraySubscriptExpr>(argExpr));
+    }
+    auto argDecl = cast<VarDecl>(cast<DeclRefExpr>(argExpr)->getDecl());
+    assert((argDecl->getType()->isPointerType() ||
+            argDecl->getType()->isArrayType()) &&
+           "only array type need to find orignial arg");
+    if (isa<ParmVarDecl>(argDecl)) {
+      assert(callStack.size() > 1 && "top function shouldn't have parameter");
+      return getArgFromParm(cast<ParmVarDecl>(argDecl), callStack.drop_back());
+    } else {
+      assert(argDecl->isLocalVarDecl() || varIsGloal(argDecl));
+      return argDecl;
     }
   }
 
@@ -550,6 +594,19 @@ return true;
         errs() << "[END]\n";
     }
   }
+
+  void dumpCallStack() {
+    errs() << "[Call Stack]: ";
+    if (callStack.empty()) {
+      errs() << "Empty\n";
+      return;
+    }
+    for (size_t len = callStack.size(), i = 0; i < len - 1; ++i) {
+      errs() << getStmtString(callStack[i], Context) << " --> ";
+    }
+    errs() << getStmtString(callStack[callStack.size() - 1], Context) << "\n";
+  }
+
   std::vector<UniqueRef> dumpRefs(VarDecl* v) {
     errs() << "[VAR]: " << v->getName() << "\n";
     uint32_t tmpIndex = 0;
@@ -581,8 +638,8 @@ return true;
   friend class FindSideEffectFuncVisitor;
   sideEffectMap& writeEffectFuncs;
   sideEffectMap& readEffectFuncs;
-  std::vector<FunctionDecl*>& allFuncs;
   ASTContext* Context;
+  std::vector<CallExpr*> callStack;
   uint64_t refCnt = 0;
 
   // used for single stmt traversal
@@ -619,8 +676,8 @@ class UBCheckConsumer : public clang::ASTConsumer {
       : writeEffectMap(),
         readEffectMap(),
         allFuncs(),
-        Visitor(Context, writeEffectMap, readEffectMap, allFuncs),
-        UBVisitor(Context, writeEffectMap, readEffectMap, allFuncs) {}
+        Visitor(Context, writeEffectMap, readEffectMap),
+        UBVisitor(Context, writeEffectMap, readEffectMap) {}
 
   virtual void HandleTranslationUnit(clang::ASTContext& Context) {
     Visitor.TraverseDecl(Context.getTranslationUnitDecl());
@@ -659,7 +716,7 @@ class UBCheckConsumer : public clang::ASTConsumer {
         }
       }
     }
-    UBVisitor.TraverseDecl(Context.getTranslationUnitDecl());
+    UBVisitor.UBcheck(Visitor.main);
   }
 
  private:
