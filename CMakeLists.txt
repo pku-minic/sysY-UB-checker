@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10.0)
-project(koopa-UBcheck VERSION 0.1.0)
+project(SysY-UB-checker VERSION 0.1.0)
 include(GNUInstallDirs)
 
 #set(CMAKE_INSTALL_RPATH $ORIGIN/../lib)
