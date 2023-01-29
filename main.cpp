@@ -25,15 +25,17 @@
 /// actually, getint and getch also has side effect not
 /// associated with variable(e.g., getint() / getint() ). To work
 /// around this, I introduce a special global varibale __globalInput__
-/// and let getarray, getch, getint write this variable. putint, putch,
-/// putarray can't cause UB becouse their return value is void and will
-/// not participate in expression.
+/// and let getarray, getch... write this variable.
 // clang-format off
 const char* declstr =
     "int __globalInput__; int getint(){__globalInput__ = __globalInput__ + 1;return 1;} "
-    "int getch(){return getint();} int getarray(int a[]){a[0] = 1;return getint();}" 
-    "void putint(int){} void putch(int){} void putarray(int, int[]){}"
-    "void starttime(){} void stoptime(){}\n";
+    "int getch(){__globalInput__ = __globalInput__ + 1;return 1;} "
+    "int getarray(int a[]){a[0] = 1;__globalInput__ = __globalInput__ + 1;return 1;}" 
+    "void putint(int){__globalInput__ = __globalInput__ + 1;}"
+    "void putch(int){__globalInput__ = __globalInput__ + 1;}"
+    "void putarray(int, int a[]){__globalInput__ = __globalInput__ + 1;a[0] + 1;}"
+    "void starttime(){}"
+    "void stoptime(){}\n";
 // clang-format on
 
 using namespace llvm;
@@ -748,7 +750,9 @@ int main(int argc, const char** argv) {
   code << declstr;
   code << file.rdbuf();
   if (verbose) errs() << code.str();
+  std::vector<std::string> args = extraArgs;
+  args.push_back("-Wno-unused-value");
   runToolOnCodeWithArgs(std::make_unique<FindSideEffectFuncAction>(),
-                        code.str(), extraArgs, inputFile);
+                        code.str(), args, inputFile);
   return 0;
 }
