@@ -25,15 +25,16 @@
 /// actually, getint and getch also has side effect not
 /// associated with variable(e.g., getint() / getint() ). To work
 /// around this, I introduce a special global varibale __globalInput__
-/// and let getarray, getch... write this variable.
+/// and let getarray, getch... write this variable and the same for __globalOutput__.
 // clang-format off
 const char* declstr =
-    "int __globalInput__; int getint(){__globalInput__ = __globalInput__ + 1;return 1;} "
+    "int __globalInput__; int __globalOutput__;"
+    "int getint(){__globalInput__ = __globalInput__ + 1;return 1;} "
     "int getch(){__globalInput__ = __globalInput__ + 1;return 1;} "
     "int getarray(int a[]){a[0] = 1;__globalInput__ = __globalInput__ + 1;return 1;}" 
-    "void putint(int){__globalInput__ = __globalInput__ + 1;}"
-    "void putch(int){__globalInput__ = __globalInput__ + 1;}"
-    "void putarray(int, int a[]){__globalInput__ = __globalInput__ + 1;a[0] + 1;}"
+    "void putint(int){__globalOutput__ = __globalOutput__ + 1;}"
+    "void putch(int){__globalOutput__ = __globalOutput__ + 1;}"
+    "void putarray(int, int a[]){__globalOutput__ = __globalOutput__ + 1;a[0] + 1;}"
     "void starttime(){}"
     "void stoptime(){}\n";
 // clang-format on

@@ -6,7 +6,8 @@ int f(int x) {
 void g(int x, int y) {}
 
 int main() {
-  g(f(1), f(2));      // 可能输出 12 或 21
-  return f(3) + f(4); // 可能输出 34 或 43
+  g(f(1), f(2));      // UB
+  g(getint(), f(2));  // not a UB
+  return f(3) + f(4); // UB
 }
 
